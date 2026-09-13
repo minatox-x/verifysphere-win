@@ -60,18 +60,33 @@ jobs:
       # 5. Build & publish self-contained single-file EXE
       #    Mirrors "Build release APK" from Android workflow.
       #    --no-restore skips a second restore since step 4 already ran.
-      #    -p:Version injects the tag as the assembly version.
+      #
+      #    AssemblyVersion and FileVersion must be purely numeric
+      #    (major.minor.build.revision). Version (informational) may be
+      #    any string. We compute both separately so manual/branch runs
+      #    never pass a non-numeric value to AssemblyVersion.
       # ----------------------------------------------------------------
       - name: Build release EXE
         shell: pwsh
         run: |
-          $VERSION = "${{ github.ref_name }}"
-          # If ref_name is not a version tag (e.g. a branch name like "main"), use a timestamped fallback
-          if (-not $VERSION -or $VERSION -notmatch '^\d') {
-            $VERSION = "manual-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          $REF = "${{ github.ref_name }}"
+          # Strip leading 'v' for SemVer (e.g. v1.0.0 → 1.0.0)
+          $SEMVER = $REF -replace '^v', ''
+
+          if ($SEMVER -match '^\d+(\.\d+)*$') {
+            # Real version tag — pad to 4 numeric parts for AssemblyVersion
+            $parts = $SEMVER.Split('.')
+            while ($parts.Count -lt 4) { $parts += '0' }
+            $NUMERIC_VERSION = ($parts[0..3]) -join '.'
+            $INFO_VERSION    = $SEMVER
+          } else {
+            # Branch name or manual run — use 0.0.<date>.<time> which is always valid
+            $now = Get-Date
+            $NUMERIC_VERSION = "0.0.$($now.ToString('yyyyMMdd')).$($now.ToString('HHmmss'))"
+            $INFO_VERSION    = "manual-$($now.ToString('yyyyMMdd-HHmmss'))"
           }
-          # Strip leading 'v' for SemVer assembly version (e.g. v1.0.0 → 1.0.0)
-          $SEMVER = $VERSION -replace '^v', ''
+
+          Write-Output "INFO_VERSION=$INFO_VERSION  NUMERIC_VERSION=$NUMERIC_VERSION"
 
           dotnet publish src/VerifySphere/VerifySphere.csproj `
             -c Release `
@@ -81,9 +96,9 @@ jobs:
             -p:PublishSingleFile=true `
             -p:IncludeNativeLibrariesForSelfExtract=true `
             -p:PublishReadyToRun=true `
-            -p:Version=$SEMVER `
-            -p:AssemblyVersion="${SEMVER}.0" `
-            -p:FileVersion="${SEMVER}.0" `
+            -p:Version=$INFO_VERSION `
+            -p:AssemblyVersion=$NUMERIC_VERSION `
+            -p:FileVersion=$NUMERIC_VERSION `
             -o publish/
 
       # ----------------------------------------------------------------
@@ -109,12 +124,14 @@ jobs:
         id: rename_exe
         shell: pwsh
         run: |
-          $VERSION = "${{ github.ref_name }}"
-          # If ref_name is not a version tag (e.g. a branch name like "main"), use a timestamped fallback
-          if (-not $VERSION -or $VERSION -notmatch '^\d') {
-            $VERSION = "manual-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          $REF = "${{ github.ref_name }}"
+          $SEMVER = $REF -replace '^v', ''
+          if ($SEMVER -match '^\d+(\.\d+)*$') {
+            $VERSION_LABEL = $REF   # keep the 'v' prefix for the filename e.g. v1.0.0
+          } else {
+            $VERSION_LABEL = "manual-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
           }
-          $NEW_NAME = "VerifySphere-${VERSION}.exe"
+          $NEW_NAME = "VerifySphere-${VERSION_LABEL}.exe"
           Copy-Item "publish/VerifySphere.exe" $NEW_NAME
           echo "exe_name=$NEW_NAME" >> $env:GITHUB_OUTPUT
           Write-Output "Renamed to: $NEW_NAME"
