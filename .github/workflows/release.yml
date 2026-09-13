@@ -73,16 +73,26 @@ jobs:
           # Strip leading 'v' for SemVer (e.g. v1.0.0 → 1.0.0)
           $SEMVER = $REF -replace '^v', ''
 
+          # AssemblyVersion/FileVersion require EXACTLY 4 parts, each an integer
+          # in the range 0-65535 (they are stored as UInt16 in the PE header).
+          # A raw date (20260913) or time (162336) blows past that limit, which
+          # is what caused the previous failures — this version fixes that by
+          # only ever using values that fit: day-of-year (max 366) and
+          # minutes-since-midnight (max 1439).
           if ($SEMVER -match '^\d+(\.\d+)*$') {
-            # Real version tag — pad to 4 numeric parts for AssemblyVersion
-            $parts = $SEMVER.Split('.')
-            while ($parts.Count -lt 4) { $parts += '0' }
-            $NUMERIC_VERSION = ($parts[0..3]) -join '.'
+            $parts = $SEMVER.Split('.') | ForEach-Object {
+              $n = [int]$_
+              if ($n -gt 65535) { $n = 65535 }   # clamp defensively, just in case
+              $n
+            }
+            while ($parts.Count -lt 4) { $parts += 0 }
+            $NUMERIC_VERSION = ($parts[0..3] -join '.')
             $INFO_VERSION    = $SEMVER
           } else {
-            # Branch name or manual run — use 0.0.<date>.<time> which is always valid
             $now = Get-Date
-            $NUMERIC_VERSION = "0.0.$($now.ToString('yyyyMMdd')).$($now.ToString('HHmmss'))"
+            $dayOfYear = $now.DayOfYear                                   # 1-366
+            $minuteOfDay = ($now.Hour * 60) + $now.Minute                 # 0-1439
+            $NUMERIC_VERSION = "0.0.$dayOfYear.$minuteOfDay"
             $INFO_VERSION    = "manual-$($now.ToString('yyyyMMdd-HHmmss'))"
           }
 
