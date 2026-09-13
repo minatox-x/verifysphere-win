@@ -1,0 +1,75 @@
+<Window x:Class="VerifySphere.TurnstileWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="VerifySphere — Human Verification"
+        Width="420" Height="520"
+        MinWidth="380" MinHeight="460"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="CanMinimize"
+        Background="#FF0F0F13"
+        WindowStyle="SingleBorderWindow"
+        ShowInTaskbar="False">
+
+    <Window.Resources>
+        <!-- Matches dialog_bg from Android themes -->
+        <SolidColorBrush x:Key="DialogBg"    Color="#FF1E1E2E" />
+        <SolidColorBrush x:Key="TextPrimary" Color="#FFF1F5F9" />
+    </Window.Resources>
+
+    <Grid Background="{StaticResource DialogBg}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <Border Grid.Row="0" Padding="16,14" Background="#FF0F0F13">
+            <TextBlock Text="Complete Verification"
+                       Foreground="#FFF1F5F9"
+                       FontSize="15"
+                       FontWeight="SemiBold"
+                       HorizontalAlignment="Center" />
+        </Border>
+
+        <!-- WebView2 — renders Cloudflare Turnstile widget -->
+        <wv2:WebView2 x:Name="TurnstileWebView"
+                      Grid.Row="1"
+                      Margin="0" />
+
+        <!-- Loading overlay — shown until WebView is ready -->
+        <Grid x:Name="LoadingOverlay"
+              Grid.Row="1"
+              Background="{StaticResource DialogBg}"
+              Panel.ZIndex="10">
+            <StackPanel Orientation="Vertical"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center">
+                <ProgressBar IsIndeterminate="True"
+                             Width="48" Height="4"
+                             Foreground="#FF3B82F6"
+                             Background="#FF1A1A24"
+                             Margin="0,0,0,12" />
+                <TextBlock Text="Loading…"
+                           Foreground="#FF94A3B8"
+                           FontSize="13"
+                           HorizontalAlignment="Center" />
+            </StackPanel>
+        </Grid>
+
+        <!-- Footer / cancel -->
+        <Border Grid.Row="2" Padding="16,10" Background="#FF0F0F13">
+            <Button x:Name="BtnCancel"
+                    Content="Cancel"
+                    Click="BtnCancel_Click"
+                    HorizontalAlignment="Center"
+                    Foreground="#FF94A3B8"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    FontSize="13"
+                    Cursor="Hand"
+                    Padding="16,6" />
+        </Border>
+    </Grid>
+</Window>
