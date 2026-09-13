@@ -66,7 +66,8 @@ jobs:
         shell: pwsh
         run: |
           $VERSION = "${{ github.ref_name }}"
-          if (-not $VERSION -or $VERSION -eq "refs/heads/main") {
+          # If ref_name is not a version tag (e.g. a branch name like "main"), use a timestamped fallback
+          if (-not $VERSION -or $VERSION -notmatch '^\d') {
             $VERSION = "manual-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
           }
           # Strip leading 'v' for SemVer assembly version (e.g. v1.0.0 → 1.0.0)
@@ -109,7 +110,8 @@ jobs:
         shell: pwsh
         run: |
           $VERSION = "${{ github.ref_name }}"
-          if (-not $VERSION -or $VERSION -eq "refs/heads/main") {
+          # If ref_name is not a version tag (e.g. a branch name like "main"), use a timestamped fallback
+          if (-not $VERSION -or $VERSION -notmatch '^\d') {
             $VERSION = "manual-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
           }
           $NEW_NAME = "VerifySphere-${VERSION}.exe"
