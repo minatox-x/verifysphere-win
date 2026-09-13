@@ -20,33 +20,46 @@ jobs:
 
       # ----------------------------------------------------------------
       # 2. Set up .NET 8 (required for WPF / net8.0-windows)
-      #    Mirrors "Set up JDK 17" from Android workflow
+      #    global.json at repo root pins the SDK so the runner's newer
+      #    .NET 10 SDK does not interfere with restore.
+      #    Mirrors "Set up JDK 17" from Android workflow.
       # ----------------------------------------------------------------
       - name: Set up .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+          dotnet-quality: 'ga'
 
       # ----------------------------------------------------------------
       # 3. Cache NuGet packages
-      #    Mirrors "Cache Gradle caches" from Android workflow
+      #    Mirrors "Cache Gradle caches" from Android workflow.
+      #    Use %USERPROFILE% path — ~/.nuget resolves incorrectly on
+      #    Windows runners when multiple SDK versions are present.
       # ----------------------------------------------------------------
       - name: Cache NuGet packages
         uses: actions/cache@v4
         with:
-          path: ~/.nuget/packages
-          key: nuget-${{ hashFiles('**/*.csproj') }}
-          restore-keys: nuget-
+          path: ${{ env.USERPROFILE }}\.nuget\packages
+          key: nuget-win-${{ hashFiles('**/*.csproj', '**/global.json') }}
+          restore-keys: nuget-win-
 
       # ----------------------------------------------------------------
       # 4. Restore dependencies
+      #    Pass -r win-x64 here so restore pre-fetches the right RID
+      #    assets; this prevents the "RestoreTask returned false" error
+      #    that occurs when RID is only known at publish time.
       # ----------------------------------------------------------------
       - name: Restore dependencies
-        run: dotnet restore src/VerifySphere/VerifySphere.csproj
+        shell: pwsh
+        run: |
+          dotnet restore src/VerifySphere/VerifySphere.csproj `
+            -r win-x64 `
+            --locked-mode:false
 
       # ----------------------------------------------------------------
       # 5. Build & publish self-contained single-file EXE
       #    Mirrors "Build release APK" from Android workflow.
+      #    --no-restore skips a second restore since step 4 already ran.
       #    -p:Version injects the tag as the assembly version.
       # ----------------------------------------------------------------
       - name: Build release EXE
@@ -63,10 +76,13 @@ jobs:
             -c Release `
             -r win-x64 `
             --self-contained true `
+            --no-restore `
             -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:PublishReadyToRun=true `
             -p:Version=$SEMVER `
-            -p:AssemblyVersion="$SEMVER.0" `
-            -p:FileVersion="$SEMVER.0" `
+            -p:AssemblyVersion="${SEMVER}.0" `
+            -p:FileVersion="${SEMVER}.0" `
             -o publish/
 
       # ----------------------------------------------------------------
