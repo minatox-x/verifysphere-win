@@ -8,20 +8,14 @@
     <RootNamespace>VerifySphere</RootNamespace>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <ApplicationIcon>Resources\icon.ico</ApplicationIcon>
+    <!-- No ApplicationIcon reference — avoids restore failure when the file is absent -->
     <Version>1.0.0</Version>
     <AssemblyVersion>1.0.0.0</AssemblyVersion>
     <FileVersion>1.0.0.0</FileVersion>
-    <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>true</SelfContained>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <PublishReadyToRun>true</PublishReadyToRun>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <Optimize>true</Optimize>
-    <DebugType>none</DebugType>
-    <!-- Suppress all console output in release -->
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <Platforms>x64</Platforms>
+    <!-- PublishSingleFile / SelfContained / RuntimeIdentifier are passed at
+         publish time via CLI flags so restore does not require a fixed RID. -->
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
@@ -32,12 +26,8 @@
 
   <ItemGroup>
     <!-- WebView2 for rendering Cloudflare Turnstile (same role as TurnstileSDK on Android) -->
-    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3351.48" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2592.51" />
     <!-- No extra crypto libs needed — System.Security.Cryptography is built in -->
-  </ItemGroup>
-
-  <ItemGroup>
-    <Resource Include="Resources\icon.ico" Condition="Exists('Resources\icon.ico')" />
   </ItemGroup>
 
 </Project>
