@@ -48,12 +48,19 @@ jobs:
       #    Pass -r win-x64 here so restore pre-fetches the right RID
       #    assets; this prevents the "RestoreTask returned false" error
       #    that occurs when RID is only known at publish time.
+      #    Also pass -p:PublishReadyToRun=true here — the publish step
+      #    below uses ReadyToRun, and R2R needs its own runtime compiler
+      #    pack (Microsoft.NETCore.App.Runtime.win-x64) pulled in at
+      #    restore time. Without this flag here, restore fetches the
+      #    plain runtime pack, and publish later fails with NETSDK1094
+      #    ("valid runtime package was not found").
       # ----------------------------------------------------------------
       - name: Restore dependencies
         shell: pwsh
         run: |
           dotnet restore src/VerifySphere/VerifySphere.csproj `
             -r win-x64 `
+            -p:PublishReadyToRun=true `
             --locked-mode:false
 
       # ----------------------------------------------------------------
