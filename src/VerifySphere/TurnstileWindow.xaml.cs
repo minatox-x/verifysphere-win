@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows;
@@ -14,13 +15,25 @@ namespace VerifySphere;
 ///   - Listens for the JavaScript callback (token or error)
 ///   - Exposes OnSuccess / OnFailure events exactly like TurnstileCallback
 ///
-/// The HTML page injected mirrors what the Turnstile SDK does on Android:
-/// loads challenges.cloudflare.com/turnstile/v0/api.js and renders the widget.
+/// Key fix vs the original: the original used NavigateToString(), which gives
+/// the page a null/opaque origin. Cloudflare Turnstile validates the page origin
+/// against the sitekey's registered domain, so a null origin causes the widget
+/// to immediately fire its error-callback and close - exactly the "loads then
+/// shuts" symptom reported with real (non-test) sitekeys.
+///
+/// The fix mirrors what Android's WebView does with loadDataWithBaseURL():
+///   1. Register a WebResourceRequested filter for the real payload URL
+///   2. Navigate to that URL - so WebView2 treats it as the page origin
+///   3. Intercept the request before any network call leaves the machine
+///   4. Respond with our own Turnstile HTML, served with the real origin
+/// Cloudflare sees the correct origin (matching the sitekey domain) in the
+/// Referer / Origin headers; no actual network request to the payload URL
+/// is ever made; the URL is never displayed anywhere in the UI.
 /// </summary>
 public sealed partial class TurnstileWindow : Window
 {
     // -----------------------------------------------------------------------
-    // Events — mirror TurnstileCallback interface
+    // Events - mirror TurnstileCallback interface
     // -----------------------------------------------------------------------
     public event Action<string>? OnSuccess;  // token string
     public event Action<string>? OnFailure;  // error code string
@@ -32,6 +45,11 @@ public sealed partial class TurnstileWindow : Window
     // Timeout mirror: "load_timeout" from Android SDK
     private System.Windows.Threading.DispatcherTimer? _loadTimer;
     private const int LoadTimeoutSeconds = 30;
+
+    // The filter token returned by AddWebResourceRequestedFilter -
+    // kept so we can remove it after first use to avoid handling
+    // subsequent Cloudflare sub-resource requests.
+    private bool _mainPageServed;
 
     public TurnstileWindow(string url, string sitekey)
     {
@@ -56,7 +74,6 @@ public sealed partial class TurnstileWindow : Window
     {
         try
         {
-            // WebView2 needs a user data folder; use a temp path (no sensitive data persisted)
             var userDataFolder = System.IO.Path.Combine(
                 System.IO.Path.GetTempPath(), "VerifySphere_WebView2");
 
@@ -66,14 +83,33 @@ public sealed partial class TurnstileWindow : Window
 
             await TurnstileWebView.EnsureCoreWebView2Async(env);
 
-            // Block all navigation away from the Turnstile page — security: mirrors
-            // Android WebView's shouldOverrideUrlLoading() restriction
-            TurnstileWebView.CoreWebView2.NavigationStarting  += OnNavigationStarting;
-            TurnstileWebView.CoreWebView2.WebMessageReceived  += OnWebMessageReceived;
-            TurnstileWebView.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
+            var core = TurnstileWebView.CoreWebView2;
 
-            // Inject the Turnstile HTML — same approach as TurnstileSDK WebView on Android
-            TurnstileWebView.CoreWebView2.NavigateToString(BuildTurnstileHtml());
+            // ------------------------------------------------------------------
+            // Origin fix: intercept the navigation to _url and serve our own
+            // Turnstile HTML instead of fetching the real page.
+            //
+            // This is the Windows equivalent of Android's:
+            //   webView.loadDataWithBaseURL(url, html, "text/html", "utf-8", null)
+            //
+            // WebView2 will set the page origin to _url's origin (e.g.
+            // https://my-app.com) for all purposes - including the Origin and
+            // Referer headers sent to challenges.cloudflare.com when the
+            // Turnstile script loads. Cloudflare sees the correct domain and
+            // validates the sitekey. The actual payload URL is never fetched;
+            // we cancel and replace the response before any outbound request.
+            // ------------------------------------------------------------------
+            core.AddWebResourceRequestedFilter(_url, CoreWebView2WebResourceContext.Document);
+            core.WebResourceRequested += OnWebResourceRequested;
+
+            // Wire remaining event handlers
+            core.NavigationStarting  += OnNavigationStarting;
+            core.WebMessageReceived  += OnWebMessageReceived;
+            core.NavigationCompleted += OnNavigationCompleted;
+
+            // Navigate to the real URL - WebView2 fires WebResourceRequested
+            // before sending any network request, so we intercept it first.
+            core.Navigate(_url);
         }
         catch (Exception)
         {
@@ -82,21 +118,43 @@ public sealed partial class TurnstileWindow : Window
     }
 
     // -----------------------------------------------------------------------
-    // Turnstile HTML — mirrors what Android TurnstileSDK loads in its WebView
+    // WebResource intercept - serve Turnstile HTML with the real URL as origin
+    // -----------------------------------------------------------------------
+
+    private void OnWebResourceRequested(object? sender,
+        CoreWebView2WebResourceRequestedEventArgs e)
+    {
+        // Only intercept the first (main-page) request. Sub-resources from
+        // Cloudflare (the api.js, challenge iframes, etc.) must go out normally.
+        if (_mainPageServed) return;
+        _mainPageServed = true;
+
+        // Remove the filter so Cloudflare sub-resources are not intercepted.
+        TurnstileWebView.CoreWebView2.RemoveWebResourceRequestedFilter(
+            _url, CoreWebView2WebResourceContext.Document);
+
+        var html    = BuildTurnstileHtml();
+        var bytes   = Encoding.UTF8.GetBytes(html);
+        var stream  = new System.IO.MemoryStream(bytes);
+
+        // Respond with our HTML - same origin as _url, no actual network fetch.
+        e.Response = TurnstileWebView.CoreWebView2.Environment.CreateWebResourceResponse(
+            stream,
+            statusCode:  200,
+            reasonPhrase: "OK",
+            headers: "Content-Type: text/html; charset=utf-8");
+    }
+
+    // -----------------------------------------------------------------------
+    // Turnstile HTML
     // -----------------------------------------------------------------------
 
     private string BuildTurnstileHtml()
     {
-        // The page:
-        //  1. Loads the Turnstile script from Cloudflare
-        //  2. Renders the widget for the given sitekey
-        //  3. On callback=token  → postMessage({ type:"success", token:"..." })
-        //  4. On error / expired → postMessage({ type:"error",   error:"..." })
-        //  5. On expired token   → postMessage({ type:"expired" })
-        // This exactly mirrors the bridge the Android TurnstileSDK uses
-        // (JavaScript → Java/Kotlin bridge via addJavascriptInterface).
-
-        var escapedUrl     = System.Net.WebUtility.HtmlEncode(_url);
+        // Sitekey is injected server-side (before any JS runs) and HTML-encoded.
+        // The payload URL is used only as the navigation target above - it is
+        // never written into the HTML, never shown in the address bar (the
+        // WebView has no chrome), and never accessible to page JavaScript.
         var escapedSitekey = System.Net.WebUtility.HtmlEncode(_sitekey);
 
         return $@"<!DOCTYPE html>
@@ -130,16 +188,13 @@ public sealed partial class TurnstileWindow : Window
     <div id=""cf-widget""></div>
   </div>
   <script>
-    // Wait for Turnstile API to be ready
     function renderWidget() {{
       if (typeof turnstile === 'undefined') {{
         setTimeout(renderWidget, 100);
         return;
       }}
       turnstile.render('#cf-widget', {{
-        sitekey:  '{escapedSitekey}',
-        // Mirrors the url field from the payload — Turnstile validates against the domain
-        // The app host used as the 'base' URL context
+        sitekey: '{escapedSitekey}',
         callback: function(token) {{
           window.chrome.webview.postMessage(JSON.stringify({{ type:'success', token:token }}));
         }},
@@ -170,25 +225,26 @@ public sealed partial class TurnstileWindow : Window
     private void OnNavigationCompleted(object? sender,
         CoreWebView2NavigationCompletedEventArgs e)
     {
-        // Hide loading overlay once the page is ready
         Dispatcher.Invoke(() => LoadingOverlay.Visibility = Visibility.Collapsed);
     }
 
     private void OnNavigationStarting(object? sender,
         CoreWebView2NavigationStartingEventArgs e)
     {
-        // Block any navigation that isn't the initial Turnstile page or Cloudflare resources.
-        // Mirrors Android's WebViewClient.shouldOverrideUrlLoading() restriction.
+        // After our page is served, allow:
+        //   - The initial navigation to _url (handled by WebResourceRequested above)
+        //   - All cloudflare.com sub-navigations (challenge iframes, etc.)
+        //   - about: / data: internal URIs
+        // Block everything else.
         var uri = e.Uri ?? "";
         bool isAllowed =
-            uri.StartsWith("about:",      StringComparison.OrdinalIgnoreCase) ||
-            uri.StartsWith("data:",       StringComparison.OrdinalIgnoreCase) ||
-            uri.Contains("cloudflare.com", StringComparison.OrdinalIgnoreCase);
+            uri.Equals(_url, StringComparison.OrdinalIgnoreCase) ||
+            uri.StartsWith("about:",         StringComparison.OrdinalIgnoreCase) ||
+            uri.StartsWith("data:",          StringComparison.OrdinalIgnoreCase) ||
+            uri.Contains("cloudflare.com",   StringComparison.OrdinalIgnoreCase);
 
         if (!isAllowed)
-        {
             e.Cancel = true;
-        }
     }
 
     private void OnWebMessageReceived(object? sender,
@@ -199,9 +255,9 @@ public sealed partial class TurnstileWindow : Window
             var json = e.TryGetWebMessageAsString();
             if (json == null) return;
 
-            using var doc  = JsonDocument.Parse(json);
-            var root       = doc.RootElement;
-            var type       = root.TryGetProperty("type", out var t) ? t.GetString() : null;
+            using var doc = JsonDocument.Parse(json);
+            var root      = doc.RootElement;
+            var type      = root.TryGetProperty("type", out var t) ? t.GetString() : null;
 
             switch (type)
             {
@@ -212,9 +268,7 @@ public sealed partial class TurnstileWindow : Window
                         : "";
 
                     if (string.IsNullOrWhiteSpace(token))
-                    {
                         FireFailure("token_expired");
-                    }
                     else
                     {
                         StopLoadTimeout();
@@ -244,7 +298,7 @@ public sealed partial class TurnstileWindow : Window
     }
 
     // -----------------------------------------------------------------------
-    // Timeout — mirrors Android SDK's "load_timeout" failure
+    // Timeout - mirrors Android SDK's "load_timeout" failure
     // -----------------------------------------------------------------------
 
     private void StartLoadTimeout()
@@ -262,7 +316,7 @@ public sealed partial class TurnstileWindow : Window
     }
 
     // -----------------------------------------------------------------------
-    // Cancel button — mirrors "cancelled" from Android SDK
+    // Cancel button
     // -----------------------------------------------------------------------
 
     private void BtnCancel_Click(object sender, RoutedEventArgs e)
@@ -272,13 +326,12 @@ public sealed partial class TurnstileWindow : Window
 
     private void TurnstileWindow_Closed(object? sender, EventArgs e)
     {
-        // If the window is closed without a callback, treat as cancelled
         if (!_callbackFired)
             FireFailure("cancelled");
     }
 
     // -----------------------------------------------------------------------
-    // Fire callbacks — mirrors TurnstileCallback.onSuccess / onFailure
+    // Fire callbacks
     // -----------------------------------------------------------------------
 
     private void FireSuccess(string token)
