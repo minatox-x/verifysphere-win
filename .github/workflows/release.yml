@@ -115,6 +115,10 @@ jobs:
 
       # ----------------------------------------------------------------
       # 6. Verify the EXE was produced
+      #    This raw EXE is an internal build artifact only - it never
+      #    gets uploaded or released on its own. It exists purely as
+      #    input for the installer built in step 7, which is the only
+      #    file users ever see or download.
       # ----------------------------------------------------------------
       - name: Verify EXE was produced
         shell: pwsh
@@ -124,30 +128,7 @@ jobs:
           Write-Output "EXE: $($exe.FullName)  ($([math]::Round($exe.Length/1MB,2)) MB)"
 
       # ----------------------------------------------------------------
-      # 7. Rename EXE to include version tag (used as the "portable"
-      #    download alongside the installer, for users who prefer a
-      #    single file with no install step - though it will not get
-      #    the verifysphere:// URI scheme registered automatically,
-      #    since that is handled by the installer below).
-      # ----------------------------------------------------------------
-      - name: Rename EXE
-        id: rename_exe
-        shell: pwsh
-        run: |
-          $REF = "${{ github.ref_name }}"
-          $SEMVER = $REF -replace '^v', ''
-          if ($SEMVER -match '^\d+(\.\d+)*$') {
-            $VERSION_LABEL = $REF   # keep the 'v' prefix for the filename e.g. v1.0.0
-          } else {
-            $VERSION_LABEL = "manual-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-          }
-          $NEW_NAME = "VerifySphere-${VERSION_LABEL}.exe"
-          Copy-Item "publish/VerifySphere.exe" $NEW_NAME
-          echo "exe_name=$NEW_NAME" >> $env:GITHUB_OUTPUT
-          Write-Output "Renamed to: $NEW_NAME"
-
-      # ----------------------------------------------------------------
-      # 8. Install Inno Setup (installer/setup.iss compiler)
+      # 7. Install Inno Setup (installer/setup.iss compiler)
       #    windows-latest runners ship with Chocolatey pre-installed,
       #    so this does not require any extra setup or admin prompt in CI.
       # ----------------------------------------------------------------
@@ -160,7 +141,7 @@ jobs:
           echo "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
 
       # ----------------------------------------------------------------
-      # 9. Build the installer (verifysphere-setup.exe)
+      # 8. Build the installer (verifysphere-setup.exe)
       #    - Copies the unversioned VerifySphere.exe next to setup.iss
       #      (the [Files] section in setup.iss expects it there)
       #    - Compiles with ISCC, passing the same version string used
@@ -170,6 +151,10 @@ jobs:
       #      so no separate PowerShell script is needed by the user at
       #      all - install and uninstall both happen from the wizard /
       #      Windows "Apps & Features" respectively.
+      #
+      #    This is now the ONLY file that reaches users. There is no
+      #    separate "portable EXE" download anymore - one file, one
+      #    obvious thing to click, nothing to be confused between.
       # ----------------------------------------------------------------
       - name: Build installer (verifysphere-setup.exe)
         shell: pwsh
@@ -181,36 +166,45 @@ jobs:
             throw "Installer build failed - verifysphere-setup.exe not found"
           }
           Copy-Item "installer\verifysphere-setup.exe" "verifysphere-setup.exe"
+
+          # Sanity check: the raw self-contained EXE bundles the full .NET
+          # runtime (~150-180 MB) and LZMA2 compresses that down to roughly
+          # 40-60 MB in normal builds - that size drop is expected and not
+          # a sign of missing content. What IS a real problem is a build
+          # that's much smaller than that, which would mean the installer
+          # is truncated or the app never got embedded correctly. Fail loud
+          # here instead of silently shipping a broken installer.
+          $installerSizeMB = [math]::Round((Get-Item "verifysphere-setup.exe").Length / 1MB, 1)
+          Write-Output "Installer size: $installerSizeMB MB"
+          if ($installerSizeMB -lt 20) {
+            throw "verifysphere-setup.exe is only $installerSizeMB MB - expected 30+ MB. The app likely did not get embedded correctly."
+          }
           Write-Output "Installer built: verifysphere-setup.exe"
 
       # ----------------------------------------------------------------
-      # 10. Upload installer + portable EXE as workflow artifacts
-      #     (always available, even on non-tag/manual runs)
+      # 9. Upload installer as workflow artifact (always available,
+      #    even on non-tag/manual runs)
       # ----------------------------------------------------------------
-      - name: Upload build artifacts
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: VerifySphere-Windows
-          path: |
-            verifysphere-setup.exe
-            ${{ steps.rename_exe.outputs.exe_name }}
+          path: verifysphere-setup.exe
           retention-days: 30
 
       # ----------------------------------------------------------------
-      # 11. Create GitHub Release (only on version tags)
+      # 10. Create GitHub Release (only on version tags)
       # ----------------------------------------------------------------
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            verifysphere-setup.exe
-            ${{ steps.rename_exe.outputs.exe_name }}
+          files: verifysphere-setup.exe
           name: "VerifySphere ${{ github.ref_name }}"
           body: |
             ## VerifySphere ${{ github.ref_name }} (Windows)
 
-            ### Installation (recommended)
+            ### Installation
             1. Download and run `verifysphere-setup.exe`
             2. Follow the setup wizard - no Administrator rights needed
             3. VerifySphere is installed, added to your Start Menu, listed
@@ -219,12 +213,6 @@ jobs:
 
             To uninstall: **Settings > Apps > Installed apps > VerifySphere > Uninstall**
             (this also removes the `verifysphere://` URI scheme registration)
-
-            ### Portable option
-            `${{ steps.rename_exe.outputs.exe_name }}` is a standalone EXE for
-            users who don't want to install anything. It will run fine, but
-            since nothing registers it, clicking a `verifysphere://` link will
-            not automatically open it - use the installer above for that.
 
             ### Usage
             Click or navigate to a `verifysphere://verify?data=<encrypted_payload>` link.
