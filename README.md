@@ -124,10 +124,6 @@ Start-Process "verifysphere://verify?data=<output>"
 
 This removes the app and automatically de-registers the `verifysphere://` URI scheme — no leftover Registry entries.
 
-### Portable option
-
-The Releases page also includes a standalone `VerifySphere-v*.exe` for anyone who'd rather not install anything. It runs fine on its own, but since nothing registers it with Windows, `verifysphere://` links won't automatically open it — use the installer above if you need that.
-
 ---
 
 ## Building from source
@@ -173,10 +169,10 @@ Same structure as the Android workflow:
 | Cache | Gradle | NuGet |
 | Build command | `./gradlew :app:assembleRelease` | `dotnet publish` |
 | Signing | JKS keystore via `-P` flags | N/A (no mandatory signing on Windows) |
-| Packaging | APK only | Inno Setup installer + portable EXE |
-| Output | `VerifySphere-v*.apk` | `verifysphere-setup.exe` + `VerifySphere-v*.exe` |
+| Packaging | APK only | Inno Setup installer |
+| Output | `VerifySphere-v*.apk` | `verifysphere-setup.exe` |
 | Trigger | `v*` tag or manual | `v*` tag or manual |
-| Release | GitHub Release with APK | GitHub Release with installer + portable EXE |
+| Release | GitHub Release with APK | GitHub Release with installer |
 
 ### Push a release tag
 
@@ -191,7 +187,7 @@ GitHub Actions will:
 1. Build the self-contained release EXE.
 2. Compile the Inno Setup installer (`verifysphere-setup.exe`).
 3. Upload both as a workflow artifact (30-day retention).
-4. Create a GitHub Release with the installer and portable EXE attached (on version tags).
+4. Create a GitHub Release with the installer attached (on version tags).
 
 You can also trigger manually: **Actions → Build & Release Windows EXE → Run workflow**.
 
