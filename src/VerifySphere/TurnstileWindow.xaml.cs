@@ -140,9 +140,9 @@ public sealed partial class TurnstileWindow : Window
 
         e.Response = TurnstileWebView.CoreWebView2.Environment.CreateWebResourceResponse(
             stream,
-            statusCode:   200,
-            reasonPhrase: "OK",
-            headers:      "Content-Type: text/html; charset=utf-8");
+            200,
+            "OK",
+            "Content-Type: text/html; charset=utf-8");
     }
 
     // -----------------------------------------------------------------------
