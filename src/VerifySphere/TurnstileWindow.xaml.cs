@@ -10,30 +10,33 @@ namespace VerifySphere;
 /// <summary>
 /// Renders a Cloudflare Turnstile challenge inside a WebView2 dialog.
 ///
-/// Origin strategy (mirrors Android loadDataWithBaseURL):
-///   Android sets baseUrl so the WebView reports the correct origin to
-///   Cloudflare without ever fetching that URL.  We do the same on Windows:
+/// ORIGIN FIX (the actual root cause of "flashes then fails"):
 ///
-///   1. AddWebResourceRequestedFilter intercepts ALL requests to a stable
-///      fake internal URL (https://verifysphere.internal/turnstile).
-///   2. We navigate to that fake URL - so the real payload URL (_url) never
-///      touches the WebView navigation pipeline at all, never appears in any
-///      event, and is never reachable by the user.
-///   3. WebResourceRequested fires; we respond with our HTML but also inject
-///      a "Referer: <_url>" and "Origin: <origin of _url>" header into the
-///      response so that the Turnstile api.js sub-requests carry the correct
-///      origin when they call challenges.cloudflare.com.
-///   4. All WebView2 chrome features that could expose internals are disabled:
-///      context menu, status bar, dev tools, default download UI.
+/// A page's origin is determined ONLY by the URL passed to Navigate().
+/// It is NOT affected by response headers, and it is NOT something you can
+/// fake by injecting "Origin:"/"Referer:" headers on an intercepted response -
+/// browsers (and WebView2) compute origin from the navigated URL itself,
+/// before any response is even received. An earlier attempt navigated to a
+/// fake internal URL (https://verifysphere.internal/...) to hide the real
+/// URL from the WebView - but that made the page's real origin
+/// "https://verifysphere.internal", which does not match the domain the
+/// sitekey is registered for. Cloudflare Turnstile checks this origin against
+/// the sitekey's configured domain and fails immediately when they don't
+/// match - exactly the instant "verification failed" symptom. The
+/// always-pass test sitekey (1x0000...) skips this origin check entirely,
+/// which is why it kept working while real sitekeys did not.
 ///
-/// Result: the user sees only the widget, no URL, no HTML, no right-click menu.
-/// Cloudflare sees the correct domain origin.  The payload URL stays private.
+/// THE FIX: navigate to the REAL _url (so the browsing context's origin is
+/// genuinely correct and matches what the sitekey expects), but intercept
+/// that exact navigation request via WebResourceRequested and serve our own
+/// HTML instead of ever actually fetching the real page. Interception does
+/// NOT change the document's origin - only the URL passed to Navigate() does.
+/// So Cloudflare sees the correct origin, no real network request to _url is
+/// ever made, and the URL itself never touches any visible UI because the
+/// WebView chrome (status bar, context menu, dev tools) is disabled below.
 /// </summary>
 public sealed partial class TurnstileWindow : Window
 {
-    // -----------------------------------------------------------------------
-    // Events - mirror TurnstileCallback interface
-    // -----------------------------------------------------------------------
     public event Action<string>? OnSuccess;
     public event Action<string>? OnFailure;
 
@@ -41,9 +44,6 @@ public sealed partial class TurnstileWindow : Window
     private readonly string _sitekey;
     private bool _callbackFired;
     private bool _mainPageServed;
-
-    // Fake internal navigation URL - never leaves the process
-    private const string InternalUrl = "https://verifysphere.internal/turnstile";
 
     private System.Windows.Threading.DispatcherTimer? _loadTimer;
     private const int LoadTimeoutSeconds = 30;
@@ -84,32 +84,33 @@ public sealed partial class TurnstileWindow : Window
             var settings = core.Settings;
 
             // ------------------------------------------------------------------
-            // Lock down the WebView so nothing internal is ever visible to user
+            // Lock down the WebView chrome so the real URL is never visible,
+            // even though we now navigate to it for correct origin behaviour.
             // ------------------------------------------------------------------
-            settings.IsStatusBarEnabled             = false;  // no URL in bottom bar
+            settings.IsStatusBarEnabled             = false;  // no URL on hover
             settings.AreDefaultContextMenusEnabled  = false;  // no right-click menu
             settings.AreDevToolsEnabled             = false;  // no F12 / inspect
-            settings.IsZoomControlEnabled           = false;  // no Ctrl+scroll zoom UI
-            settings.AreDefaultScriptDialogsEnabled = false;  // no alert/confirm popups
-            settings.IsBuiltInErrorPageEnabled      = false;  // no WebView error pages
-            settings.IsSwipeNavigationEnabled       = false;  // no swipe back/forward
+            settings.IsZoomControlEnabled           = false;
+            settings.AreDefaultScriptDialogsEnabled = false;
+            settings.IsBuiltInErrorPageEnabled      = false;
+            settings.IsSwipeNavigationEnabled        = false;
 
             // ------------------------------------------------------------------
-            // Intercept the fake internal URL we will navigate to.
-            // The real payload URL (_url) is NEVER passed to core.Navigate()
-            // so it never appears in any WebView event or UI surface.
+            // Intercept the exact navigation to _url. This is what lets us
+            // navigate to the real URL (for correct origin) while never
+            // actually sending a request over the network.
             // ------------------------------------------------------------------
-            core.AddWebResourceRequestedFilter(
-                InternalUrl, CoreWebView2WebResourceContext.Document);
+            core.AddWebResourceRequestedFilter(_url, CoreWebView2WebResourceContext.Document);
             core.WebResourceRequested += OnWebResourceRequested;
 
-            // Wire other handlers
             core.NavigationStarting  += OnNavigationStarting;
             core.WebMessageReceived  += OnWebMessageReceived;
             core.NavigationCompleted += OnNavigationCompleted;
 
-            // Navigate to the fake URL - real URL stays private
-            core.Navigate(InternalUrl);
+            // Navigate to the REAL url - this is what gives Cloudflare the
+            // correct origin. The request itself never leaves the machine
+            // because WebResourceRequested intercepts it below.
+            core.Navigate(_url);
         }
         catch (Exception)
         {
@@ -118,7 +119,7 @@ public sealed partial class TurnstileWindow : Window
     }
 
     // -----------------------------------------------------------------------
-    // WebResource intercept
+    // WebResource intercept - serve our HTML instead of fetching the real page
     // -----------------------------------------------------------------------
 
     private void OnWebResourceRequested(object? sender,
@@ -127,40 +128,21 @@ public sealed partial class TurnstileWindow : Window
         if (_mainPageServed) return;
         _mainPageServed = true;
 
-        // Remove filter - only needed for the one main-page request
+        // Remove the filter now - only the main document request needs
+        // interception. Cloudflare's own sub-requests (api.js, challenge
+        // iframes hosted on challenges.cloudflare.com) must go out for real.
         TurnstileWebView.CoreWebView2.RemoveWebResourceRequestedFilter(
-            InternalUrl, CoreWebView2WebResourceContext.Document);
+            _url, CoreWebView2WebResourceContext.Document);
 
         var html   = BuildTurnstileHtml();
         var bytes  = Encoding.UTF8.GetBytes(html);
         var stream = new System.IO.MemoryStream(bytes);
 
-        // Build the origin of _url so Cloudflare sub-requests carry it
-        // e.g. "https://my-app.com" from "https://my-app.com/somepage"
-        string payloadOrigin;
-        try
-        {
-            var parsed = new Uri(_url);
-            payloadOrigin = $"{parsed.Scheme}://{parsed.Authority}";
-        }
-        catch
-        {
-            payloadOrigin = _url;
-        }
-
-        // Serve our HTML with correct Content-Type.
-        // Also set Referer and Origin response headers so the Turnstile
-        // api.js requests inherit the correct domain context.
-        // These are HTTP response headers on the synthetic response -
-        // they are never visible to the user, only to the Cloudflare
-        // script running inside the WebView.
-        var headers =
-            "Content-Type: text/html; charset=utf-8\r\n" +
-            $"Referer: {_url}\r\n" +
-            $"Origin: {payloadOrigin}";
-
-        e.Response = TurnstileWebView.CoreWebView2.Environment
-            .CreateWebResourceResponse(stream, 200, "OK", headers);
+        e.Response = TurnstileWebView.CoreWebView2.Environment.CreateWebResourceResponse(
+            stream,
+            statusCode:   200,
+            reasonPhrase: "OK",
+            headers:      "Content-Type: text/html; charset=utf-8");
     }
 
     // -----------------------------------------------------------------------
@@ -169,8 +151,8 @@ public sealed partial class TurnstileWindow : Window
 
     private string BuildTurnstileHtml()
     {
-        // _url and payloadOrigin are NOT written into the HTML.
-        // Only the sitekey (which is not secret) is embedded.
+        // Only the sitekey (not secret) is embedded. _url itself is never
+        // written into the HTML or exposed to page JavaScript.
         var escapedSitekey = System.Net.WebUtility.HtmlEncode(_sitekey);
 
         return $@"<!DOCTYPE html>
@@ -235,7 +217,7 @@ public sealed partial class TurnstileWindow : Window
     }
 
     // -----------------------------------------------------------------------
-    // Navigation guard - only allow Cloudflare and internal resources
+    // Navigation guard
     // -----------------------------------------------------------------------
 
     private void OnNavigationStarting(object? sender,
@@ -243,7 +225,7 @@ public sealed partial class TurnstileWindow : Window
     {
         var uri = e.Uri ?? "";
         bool isAllowed =
-            uri.Equals(InternalUrl,            StringComparison.OrdinalIgnoreCase) ||
+            uri.Equals(_url,                   StringComparison.OrdinalIgnoreCase) ||
             uri.StartsWith("about:",           StringComparison.OrdinalIgnoreCase) ||
             uri.StartsWith("data:",            StringComparison.OrdinalIgnoreCase) ||
             uri.Contains("cloudflare.com",     StringComparison.OrdinalIgnoreCase);
