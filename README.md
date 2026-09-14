@@ -2,7 +2,7 @@
 
 > Windows port of the VerifySphere Android app. Handles `verifysphere://` deep-links, runs a Cloudflare Turnstile verification challenge in an embedded WebView2, and delivers the encrypted token back to a callback URL in the default browser.
 
-**Exact same logic as the Android version.** Same AES-256-CBC crypto, same payload format, same flow, same UI states, same error codes. Encrypted payloads generated with `scripts/encrypt_payload.py` work for **both** the Android APK and the Windows EXE.
+**Exact same logic as the Android version.** Same AES-256-CBC crypto, same payload format, same flow, same UI states, same error codes. Encrypted payloads generated with `scripts/encrypt_payload.py` work for **both** the Android APK and the Windows app.
 
 ---
 
@@ -64,19 +64,19 @@ On your server, decrypt the `token` parameter with AES-256-CBC to get the raw Tu
 
 ## Encryption key
 
-The default key in `CryptoHelper.cs` is:
+The AES-256 key is split across four private methods (`P1()`–`P4()`) in `CryptoHelper.cs`, mirroring the `p1()`–`p4()` obfuscation in the Android app.
 
-```
-VerifySpherKey1AES256BitSecret!
-```
+**Before building for your own deployment, replace the key with your own random 32 bytes:**
 
-(32 bytes → AES-256)
+1. Generate a fresh key:
+   ```bash
+   python3 -c "import os; k=os.urandom(32); print(list(k))"
+   ```
+2. Split the 32 bytes into four groups of 8 and update `P1()`–`P4()` in `CryptoHelper.cs` accordingly.
+3. Update `KEY_BYTES` in `scripts/encrypt_payload.py` to the same 32 bytes.
+4. If you're also using the Android app, update `CryptoHelper.kt` to match.
 
-**Replace this with your own random 32-byte key** before building. Edit the four `P1()–P4()` byte arrays in `CryptoHelper.cs` and update `KEY_BYTES` in `scripts/encrypt_payload.py` to match. If you're also using the Android app, update `CryptoHelper.kt` to the same key.
-
-```bash
-python3 -c "import os; k=os.urandom(32); print(list(k))"
-```
+Never commit your production key to a public repository — treat it the same as any other shared secret.
 
 ---
 
@@ -84,38 +84,25 @@ python3 -c "import os; k=os.urandom(32); print(list(k))"
 
 - **Windows 10 / 11 (x64)**
 - **Microsoft Edge WebView2 Runtime** — pre-installed on Windows 10 1803+ and all Windows 11. If missing, install from: https://developer.microsoft.com/microsoft-edge/webview2/
-- **.NET 8 Runtime** — bundled in the self-contained EXE (no separate install needed)
+- **.NET 8 Runtime** — bundled in the self-contained build (no separate install needed)
 
 ---
 
 ## Installation
 
-### 1. Download the release
+### 1. Download and run the installer
 
-From GitHub Releases, download:
-- `VerifySphere-v*.exe`
-- `install_uri_scheme.ps1`
+From GitHub Releases, download `verifysphere-setup.exe` and run it.
 
-Place both in the same folder, e.g. `C:\Program Files\VerifySphere\`.
+- No Administrator rights required
+- Installs to your user profile (`%LocalAppData%\Programs\VerifySphere`)
+- Adds a Start Menu shortcut and (optionally) a Desktop shortcut
+- Registers the `verifysphere://` URI scheme automatically — the Windows equivalent of Android's `<intent-filter>` in `AndroidManifest.xml`
+- Shows up in **Settings → Apps → Installed apps**, with a working uninstaller
 
-### 2. Register the verifysphere:// URI scheme (once)
+That's it — no PowerShell, no manual Registry edits, no separate script to run.
 
-Open **PowerShell as Administrator** and run:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\install_uri_scheme.ps1
-```
-
-This writes the necessary Windows Registry keys so that clicking a `verifysphere://` link launches VerifySphere — the Windows equivalent of Android's `<intent-filter>` in `AndroidManifest.xml`.
-
-To specify a custom EXE path:
-
-```powershell
-.\install_uri_scheme.ps1 -ExePath "C:\Program Files\VerifySphere\VerifySphere-v1.0.0.exe"
-```
-
-### 3. Test
+### 2. Test
 
 ```powershell
 # Generate a test link
@@ -131,11 +118,15 @@ Start-Process "verifysphere://verify?data=<output>"
 # Or just paste it into a browser address bar
 ```
 
-### 4. Uninstall
+### 3. Uninstall
 
-```powershell
-.\install_uri_scheme.ps1 -Uninstall
-```
+**Settings → Apps → Installed apps → VerifySphere → Uninstall**
+
+This removes the app and automatically de-registers the `verifysphere://` URI scheme — no leftover Registry entries.
+
+### Portable option
+
+The Releases page also includes a standalone `VerifySphere-v*.exe` for anyone who'd rather not install anything. It runs fine on its own, but since nothing registers it with Windows, `verifysphere://` links won't automatically open it — use the installer above if you need that.
 
 ---
 
@@ -145,8 +136,9 @@ Start-Process "verifysphere://verify?data=<output>"
 
 - .NET 8 SDK: https://dotnet.microsoft.com/download/dotnet/8.0
 - Windows 10 or 11 (x64)
+- [Inno Setup 6](https://jrsoftware.org/isinfo.php) — only needed if you want to build the installer yourself (`installer/setup.iss`)
 
-### Build
+### Build the app
 
 ```powershell
 dotnet publish src/VerifySphere/VerifySphere.csproj `
@@ -158,6 +150,15 @@ dotnet publish src/VerifySphere/VerifySphere.csproj `
 ```
 
 Output: `publish/VerifySphere.exe` (~110 MB self-contained)
+
+### Build the installer
+
+```powershell
+Copy-Item "publish/VerifySphere.exe" "installer/VerifySphere.exe"
+ISCC.exe /DMyAppVersion="1.0.0" "installer\setup.iss"
+```
+
+Output: `installer/verifysphere-setup.exe`
 
 ---
 
@@ -172,9 +173,10 @@ Same structure as the Android workflow:
 | Cache | Gradle | NuGet |
 | Build command | `./gradlew :app:assembleRelease` | `dotnet publish` |
 | Signing | JKS keystore via `-P` flags | N/A (no mandatory signing on Windows) |
-| Output | `VerifySphere-v*.apk` | `VerifySphere-v*.exe` |
+| Packaging | APK only | Inno Setup installer + portable EXE |
+| Output | `VerifySphere-v*.apk` | `verifysphere-setup.exe` + `VerifySphere-v*.exe` |
 | Trigger | `v*` tag or manual | `v*` tag or manual |
-| Release | GitHub Release with APK | GitHub Release with EXE + install script |
+| Release | GitHub Release with APK | GitHub Release with installer + portable EXE |
 
 ### Push a release tag
 
@@ -187,8 +189,9 @@ git push origin main --tags
 
 GitHub Actions will:
 1. Build the self-contained release EXE.
-2. Upload it as a workflow artifact (30-day retention).
-3. Create a GitHub Release with the EXE and install script attached (on version tags).
+2. Compile the Inno Setup installer (`verifysphere-setup.exe`).
+3. Upload both as a workflow artifact (30-day retention).
+4. Create a GitHub Release with the installer and portable EXE attached (on version tags).
 
 You can also trigger manually: **Actions → Build & Release Windows EXE → Run workflow**.
 
@@ -225,7 +228,9 @@ Use `https://www.cloudflare.com` as the `url` for all test keys.
 ```
 verifysphere-windows/
 ├── .github/workflows/
-│   └── release.yml                  ← GitHub Actions CI/CD (Windows)
+│   └── release.yml                  ← GitHub Actions CI/CD (build + installer + release)
+├── installer/
+│   └── setup.iss                    ← Inno Setup script → produces verifysphere-setup.exe
 ├── src/VerifySphere/
 │   ├── App.xaml / App.xaml.cs       ← Entry point + URI arg parsing (≈ Application class)
 │   ├── MainWindow.xaml              ← UI layout (≈ activity_main.xml)
@@ -239,7 +244,6 @@ verifysphere-windows/
 │   ├── PayloadParser.cs             ← JSON → IntentPayload (≈ PayloadParser.kt)
 │   └── VerifySphere.csproj
 ├── scripts/
-│   ├── install_uri_scheme.ps1       ← Register verifysphere:// in Registry (≈ AndroidManifest intent-filter)
 │   └── encrypt_payload.py           ← Generate deep-links (identical to Android version)
 └── README.md
 ```
@@ -250,11 +254,12 @@ verifysphere-windows/
 
 Mirrors the Android security model:
 
-- **Key obfuscation**: The AES key is split across four private methods in `CryptoHelper.cs` — same approach as `p1()–p4()` in the Android version. .NET's Release build + PublishSingleFile makes the key non-trivially hard to find but the same caveat applies: a determined attacker with a decompiler could recover it.
+- **Key obfuscation**: The AES key is split across four private methods in `CryptoHelper.cs` — same approach as `p1()–p4()` in the Android version. Release build + PublishSingleFile makes the key non-trivially hard to find, but the same caveat applies: a determined attacker with a decompiler could recover it. Use your own key, not the placeholder shipped in this repo.
 - **No disk writes**: Tokens are held in memory only and cleared when the window closes.
 - **HTTPS only**: WebView2 settings block navigation to non-Cloudflare origins.
-- **No UI leakage**: The decrypted URL, sitekey, callback URL, and raw token are never displayed on screen.
+- **No UI leakage**: The decrypted URL, sitekey, callback URL, and raw token are never displayed on screen. The Turnstile dialog also has its status bar, context menu, and dev tools disabled so the underlying page can't be inspected.
 - **No persistent WebView data**: WebView2 user data is stored in a temp folder and holds no sensitive state.
+- **No admin rights, clean uninstall**: The installer registers the `verifysphere://` URI scheme per-user (no elevation needed) and fully removes it on uninstall — no leftover Registry entries.
 
 ---
 
