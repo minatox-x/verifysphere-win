@@ -9,7 +9,7 @@ on:
 jobs:
   build:
     name: Build Signed Release EXE
-    runs-on: windows-latest   # Windows runner — required for WPF + WebView2
+    runs-on: windows-latest   # Windows runner - required for WPF + WebView2
 
     steps:
       # ----------------------------------------------------------------
@@ -22,7 +22,6 @@ jobs:
       # 2. Set up .NET 8 (required for WPF / net8.0-windows)
       #    global.json at repo root pins the SDK so the runner's newer
       #    .NET 10 SDK does not interfere with restore.
-      #    Mirrors "Set up JDK 17" from Android workflow.
       # ----------------------------------------------------------------
       - name: Set up .NET 8
         uses: actions/setup-dotnet@v4
@@ -32,8 +31,7 @@ jobs:
 
       # ----------------------------------------------------------------
       # 3. Cache NuGet packages
-      #    Mirrors "Cache Gradle caches" from Android workflow.
-      #    Use %USERPROFILE% path — ~/.nuget resolves incorrectly on
+      #    Use %USERPROFILE% path - ~/.nuget resolves incorrectly on
       #    Windows runners when multiple SDK versions are present.
       # ----------------------------------------------------------------
       - name: Cache NuGet packages
@@ -48,7 +46,7 @@ jobs:
       #    Pass -r win-x64 here so restore pre-fetches the right RID
       #    assets; this prevents the "RestoreTask returned false" error
       #    that occurs when RID is only known at publish time.
-      #    Also pass -p:PublishReadyToRun=true here — the publish step
+      #    Also pass -p:PublishReadyToRun=true here - the publish step
       #    below uses ReadyToRun, and R2R needs its own runtime compiler
       #    pack (Microsoft.NETCore.App.Runtime.win-x64) pulled in at
       #    restore time. Without this flag here, restore fetches the
@@ -65,27 +63,22 @@ jobs:
 
       # ----------------------------------------------------------------
       # 5. Build & publish self-contained single-file EXE
-      #    Mirrors "Build release APK" from Android workflow.
       #    --no-restore skips a second restore since step 4 already ran.
       #
       #    AssemblyVersion and FileVersion must be purely numeric
-      #    (major.minor.build.revision). Version (informational) may be
-      #    any string. We compute both separately so manual/branch runs
-      #    never pass a non-numeric value to AssemblyVersion.
+      #    (major.minor.build.revision), each part 0-65535 (stored as
+      #    UInt16 in the PE header). Version (informational) may be any
+      #    string. We compute both separately, and use day-of-year /
+      #    minute-of-day for the numeric fallback so it never exceeds
+      #    the 65535 limit.
       # ----------------------------------------------------------------
       - name: Build release EXE
         shell: pwsh
         run: |
           $REF = "${{ github.ref_name }}"
-          # Strip leading 'v' for SemVer (e.g. v1.0.0 → 1.0.0)
+          # Strip leading 'v' for SemVer (e.g. v1.0.0 -> 1.0.0)
           $SEMVER = $REF -replace '^v', ''
 
-          # AssemblyVersion/FileVersion require EXACTLY 4 parts, each an integer
-          # in the range 0-65535 (they are stored as UInt16 in the PE header).
-          # A raw date (20260913) or time (162336) blows past that limit, which
-          # is what caused the previous failures — this version fixes that by
-          # only ever using values that fit: day-of-year (max 366) and
-          # minutes-since-midnight (max 1439).
           if ($SEMVER -match '^\d+(\.\d+)*$') {
             $parts = $SEMVER.Split('.') | ForEach-Object {
               $n = [int]$_
@@ -104,6 +97,7 @@ jobs:
           }
 
           Write-Output "INFO_VERSION=$INFO_VERSION  NUMERIC_VERSION=$NUMERIC_VERSION"
+          echo "info_version=$INFO_VERSION" >> $env:GITHUB_OUTPUT
 
           dotnet publish src/VerifySphere/VerifySphere.csproj `
             -c Release `
@@ -117,14 +111,10 @@ jobs:
             -p:AssemblyVersion=$NUMERIC_VERSION `
             -p:FileVersion=$NUMERIC_VERSION `
             -o publish/
+        id: build_exe
 
       # ----------------------------------------------------------------
-      # 6. Register verifysphere:// URI scheme in the EXE's manifest
-      #    (the installer / setup script does this on the user's machine;
-      #     here we just verify the EXE exists and note the scheme)
-      #    Mirrors the intent-filter <data android:scheme="verifysphere"/>
-      #    in AndroidManifest.xml — no equivalent build step on Windows,
-      #    the registry is written by install_uri_scheme.ps1 at install time.
+      # 6. Verify the EXE was produced
       # ----------------------------------------------------------------
       - name: Verify EXE was produced
         shell: pwsh
@@ -134,8 +124,11 @@ jobs:
           Write-Output "EXE: $($exe.FullName)  ($([math]::Round($exe.Length/1MB,2)) MB)"
 
       # ----------------------------------------------------------------
-      # 7. Rename EXE to include version tag
-      #    Mirrors "Rename APK" step from Android workflow
+      # 7. Rename EXE to include version tag (used as the "portable"
+      #    download alongside the installer, for users who prefer a
+      #    single file with no install step - though it will not get
+      #    the verifysphere:// URI scheme registered automatically,
+      #    since that is handled by the installer below).
       # ----------------------------------------------------------------
       - name: Rename EXE
         id: rename_exe
@@ -154,57 +147,84 @@ jobs:
           Write-Output "Renamed to: $NEW_NAME"
 
       # ----------------------------------------------------------------
-      # 8. Bundle the URI scheme install script alongside the EXE
-      #    This gives users the equivalent of the Android intent-filter
-      #    (one-time run: registers verifysphere:// in Windows Registry)
+      # 8. Install Inno Setup (installer/setup.iss compiler)
+      #    windows-latest runners ship with Chocolatey pre-installed,
+      #    so this does not require any extra setup or admin prompt in CI.
       # ----------------------------------------------------------------
-      - name: Copy install script
+      - name: Install Inno Setup
         shell: pwsh
         run: |
-          Copy-Item "scripts/install_uri_scheme.ps1" "install_uri_scheme.ps1"
+          choco install innosetup --no-progress -y
+          # ISCC.exe lives here after a Chocolatey install; add to PATH
+          # for this job so later steps can call it directly by name.
+          echo "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
 
       # ----------------------------------------------------------------
-      # 9. Upload EXE + install script as workflow artifact (always available)
-      #    Mirrors "Upload APK artifact" from Android workflow
+      # 9. Build the installer (verifysphere-setup.exe)
+      #    - Copies the unversioned VerifySphere.exe next to setup.iss
+      #      (the [Files] section in setup.iss expects it there)
+      #    - Compiles with ISCC, passing the same version string used
+      #      for the app itself so the installer's "About" matches
+      #    - installer/setup.iss already contains the URI-scheme
+      #      registration (HKCU\Software\Classes\verifysphere) baked in,
+      #      so no separate PowerShell script is needed by the user at
+      #      all - install and uninstall both happen from the wizard /
+      #      Windows "Apps & Features" respectively.
       # ----------------------------------------------------------------
-      - name: Upload EXE artifact
+      - name: Build installer (verifysphere-setup.exe)
+        shell: pwsh
+        run: |
+          Copy-Item "publish/VerifySphere.exe" "installer/VerifySphere.exe"
+          $INFO_VERSION = "${{ steps.build_exe.outputs.info_version }}"
+          ISCC.exe /DMyAppVersion="$INFO_VERSION" "installer\setup.iss"
+          if (-not (Test-Path "installer\verifysphere-setup.exe")) {
+            throw "Installer build failed - verifysphere-setup.exe not found"
+          }
+          Copy-Item "installer\verifysphere-setup.exe" "verifysphere-setup.exe"
+          Write-Output "Installer built: verifysphere-setup.exe"
+
+      # ----------------------------------------------------------------
+      # 10. Upload installer + portable EXE as workflow artifacts
+      #     (always available, even on non-tag/manual runs)
+      # ----------------------------------------------------------------
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: VerifySphere-Windows
           path: |
+            verifysphere-setup.exe
             ${{ steps.rename_exe.outputs.exe_name }}
-            install_uri_scheme.ps1
           retention-days: 30
 
       # ----------------------------------------------------------------
-      # 10. Create GitHub Release (only on version tags)
-      #     Mirrors step 10 from Android workflow exactly
+      # 11. Create GitHub Release (only on version tags)
       # ----------------------------------------------------------------
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            verifysphere-setup.exe
             ${{ steps.rename_exe.outputs.exe_name }}
-            install_uri_scheme.ps1
           name: "VerifySphere ${{ github.ref_name }}"
           body: |
             ## VerifySphere ${{ github.ref_name }} (Windows)
 
-            ### Installation
-            1. Download `${{ steps.rename_exe.outputs.exe_name }}` and `install_uri_scheme.ps1`
-            2. Place both files in the same folder (e.g. `C:\Program Files\VerifySphere\`)
-            3. Run `install_uri_scheme.ps1` **once** as Administrator to register the `verifysphere://` URI scheme
-               ```powershell
-               Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-               .\install_uri_scheme.ps1 -ExePath "C:\Program Files\VerifySphere\${{ steps.rename_exe.outputs.exe_name }}"
-               ```
-            4. VerifySphere will now open automatically when you click a `verifysphere://` link
+            ### Installation (recommended)
+            1. Download and run `verifysphere-setup.exe`
+            2. Follow the setup wizard - no Administrator rights needed
+            3. VerifySphere is installed, added to your Start Menu, listed
+               in **Settings > Apps > Installed apps**, and the
+               `verifysphere://` link handler is registered automatically
 
-            ### Uninstall / Remove URI scheme
-            ```powershell
-            .\install_uri_scheme.ps1 -Uninstall
-            ```
+            To uninstall: **Settings > Apps > Installed apps > VerifySphere > Uninstall**
+            (this also removes the `verifysphere://` URI scheme registration)
+
+            ### Portable option
+            `${{ steps.rename_exe.outputs.exe_name }}` is a standalone EXE for
+            users who don't want to install anything. It will run fine, but
+            since nothing registers it, clicking a `verifysphere://` link will
+            not automatically open it - use the installer above for that.
 
             ### Usage
             Click or navigate to a `verifysphere://verify?data=<encrypted_payload>` link.
