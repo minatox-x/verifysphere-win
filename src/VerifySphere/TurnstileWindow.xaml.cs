@@ -10,46 +10,43 @@ namespace VerifySphere;
 /// <summary>
 /// Renders a Cloudflare Turnstile challenge inside a WebView2 dialog.
 ///
-/// Mirrors the behaviour of TurnstileSDK.call() + TurnstileCallback on Android:
-///   - Shows an embedded WebView with the Turnstile widget HTML
-///   - Listens for the JavaScript callback (token or error)
-///   - Exposes OnSuccess / OnFailure events exactly like TurnstileCallback
+/// Origin strategy (mirrors Android loadDataWithBaseURL):
+///   Android sets baseUrl so the WebView reports the correct origin to
+///   Cloudflare without ever fetching that URL.  We do the same on Windows:
 ///
-/// Key fix vs the original: the original used NavigateToString(), which gives
-/// the page a null/opaque origin. Cloudflare Turnstile validates the page origin
-/// against the sitekey's registered domain, so a null origin causes the widget
-/// to immediately fire its error-callback and close - exactly the "loads then
-/// shuts" symptom reported with real (non-test) sitekeys.
+///   1. AddWebResourceRequestedFilter intercepts ALL requests to a stable
+///      fake internal URL (https://verifysphere.internal/turnstile).
+///   2. We navigate to that fake URL - so the real payload URL (_url) never
+///      touches the WebView navigation pipeline at all, never appears in any
+///      event, and is never reachable by the user.
+///   3. WebResourceRequested fires; we respond with our HTML but also inject
+///      a "Referer: <_url>" and "Origin: <origin of _url>" header into the
+///      response so that the Turnstile api.js sub-requests carry the correct
+///      origin when they call challenges.cloudflare.com.
+///   4. All WebView2 chrome features that could expose internals are disabled:
+///      context menu, status bar, dev tools, default download UI.
 ///
-/// The fix mirrors what Android's WebView does with loadDataWithBaseURL():
-///   1. Register a WebResourceRequested filter for the real payload URL
-///   2. Navigate to that URL - so WebView2 treats it as the page origin
-///   3. Intercept the request before any network call leaves the machine
-///   4. Respond with our own Turnstile HTML, served with the real origin
-/// Cloudflare sees the correct origin (matching the sitekey domain) in the
-/// Referer / Origin headers; no actual network request to the payload URL
-/// is ever made; the URL is never displayed anywhere in the UI.
+/// Result: the user sees only the widget, no URL, no HTML, no right-click menu.
+/// Cloudflare sees the correct domain origin.  The payload URL stays private.
 /// </summary>
 public sealed partial class TurnstileWindow : Window
 {
     // -----------------------------------------------------------------------
     // Events - mirror TurnstileCallback interface
     // -----------------------------------------------------------------------
-    public event Action<string>? OnSuccess;  // token string
-    public event Action<string>? OnFailure;  // error code string
+    public event Action<string>? OnSuccess;
+    public event Action<string>? OnFailure;
 
     private readonly string _url;
     private readonly string _sitekey;
     private bool _callbackFired;
+    private bool _mainPageServed;
 
-    // Timeout mirror: "load_timeout" from Android SDK
+    // Fake internal navigation URL - never leaves the process
+    private const string InternalUrl = "https://verifysphere.internal/turnstile";
+
     private System.Windows.Threading.DispatcherTimer? _loadTimer;
     private const int LoadTimeoutSeconds = 30;
-
-    // The filter token returned by AddWebResourceRequestedFilter -
-    // kept so we can remove it after first use to avoid handling
-    // subsequent Cloudflare sub-resource requests.
-    private bool _mainPageServed;
 
     public TurnstileWindow(string url, string sitekey)
     {
@@ -83,33 +80,36 @@ public sealed partial class TurnstileWindow : Window
 
             await TurnstileWebView.EnsureCoreWebView2Async(env);
 
-            var core = TurnstileWebView.CoreWebView2;
+            var core     = TurnstileWebView.CoreWebView2;
+            var settings = core.Settings;
 
             // ------------------------------------------------------------------
-            // Origin fix: intercept the navigation to _url and serve our own
-            // Turnstile HTML instead of fetching the real page.
-            //
-            // This is the Windows equivalent of Android's:
-            //   webView.loadDataWithBaseURL(url, html, "text/html", "utf-8", null)
-            //
-            // WebView2 will set the page origin to _url's origin (e.g.
-            // https://my-app.com) for all purposes - including the Origin and
-            // Referer headers sent to challenges.cloudflare.com when the
-            // Turnstile script loads. Cloudflare sees the correct domain and
-            // validates the sitekey. The actual payload URL is never fetched;
-            // we cancel and replace the response before any outbound request.
+            // Lock down the WebView so nothing internal is ever visible to user
             // ------------------------------------------------------------------
-            core.AddWebResourceRequestedFilter(_url, CoreWebView2WebResourceContext.Document);
+            settings.IsStatusBarEnabled             = false;  // no URL in bottom bar
+            settings.AreDefaultContextMenusEnabled  = false;  // no right-click menu
+            settings.AreDevToolsEnabled             = false;  // no F12 / inspect
+            settings.IsZoomControlEnabled           = false;  // no Ctrl+scroll zoom UI
+            settings.AreDefaultScriptDialogsEnabled = false;  // no alert/confirm popups
+            settings.IsBuiltInErrorPageEnabled      = false;  // no WebView error pages
+            settings.IsSwipeNavigationEnabled       = false;  // no swipe back/forward
+
+            // ------------------------------------------------------------------
+            // Intercept the fake internal URL we will navigate to.
+            // The real payload URL (_url) is NEVER passed to core.Navigate()
+            // so it never appears in any WebView event or UI surface.
+            // ------------------------------------------------------------------
+            core.AddWebResourceRequestedFilter(
+                InternalUrl, CoreWebView2WebResourceContext.Document);
             core.WebResourceRequested += OnWebResourceRequested;
 
-            // Wire remaining event handlers
+            // Wire other handlers
             core.NavigationStarting  += OnNavigationStarting;
             core.WebMessageReceived  += OnWebMessageReceived;
             core.NavigationCompleted += OnNavigationCompleted;
 
-            // Navigate to the real URL - WebView2 fires WebResourceRequested
-            // before sending any network request, so we intercept it first.
-            core.Navigate(_url);
+            // Navigate to the fake URL - real URL stays private
+            core.Navigate(InternalUrl);
         }
         catch (Exception)
         {
@@ -118,31 +118,49 @@ public sealed partial class TurnstileWindow : Window
     }
 
     // -----------------------------------------------------------------------
-    // WebResource intercept - serve Turnstile HTML with the real URL as origin
+    // WebResource intercept
     // -----------------------------------------------------------------------
 
     private void OnWebResourceRequested(object? sender,
         CoreWebView2WebResourceRequestedEventArgs e)
     {
-        // Only intercept the first (main-page) request. Sub-resources from
-        // Cloudflare (the api.js, challenge iframes, etc.) must go out normally.
         if (_mainPageServed) return;
         _mainPageServed = true;
 
-        // Remove the filter so Cloudflare sub-resources are not intercepted.
+        // Remove filter - only needed for the one main-page request
         TurnstileWebView.CoreWebView2.RemoveWebResourceRequestedFilter(
-            _url, CoreWebView2WebResourceContext.Document);
+            InternalUrl, CoreWebView2WebResourceContext.Document);
 
-        var html    = BuildTurnstileHtml();
-        var bytes   = Encoding.UTF8.GetBytes(html);
-        var stream  = new System.IO.MemoryStream(bytes);
+        var html   = BuildTurnstileHtml();
+        var bytes  = Encoding.UTF8.GetBytes(html);
+        var stream = new System.IO.MemoryStream(bytes);
 
-        // Respond with our HTML - same origin as _url, no actual network fetch.
-        e.Response = TurnstileWebView.CoreWebView2.Environment.CreateWebResourceResponse(
-            stream,
-            statusCode:  200,
-            reasonPhrase: "OK",
-            headers: "Content-Type: text/html; charset=utf-8");
+        // Build the origin of _url so Cloudflare sub-requests carry it
+        // e.g. "https://my-app.com" from "https://my-app.com/somepage"
+        string payloadOrigin;
+        try
+        {
+            var parsed = new Uri(_url);
+            payloadOrigin = $"{parsed.Scheme}://{parsed.Authority}";
+        }
+        catch
+        {
+            payloadOrigin = _url;
+        }
+
+        // Serve our HTML with correct Content-Type.
+        // Also set Referer and Origin response headers so the Turnstile
+        // api.js requests inherit the correct domain context.
+        // These are HTTP response headers on the synthetic response -
+        // they are never visible to the user, only to the Cloudflare
+        // script running inside the WebView.
+        var headers =
+            "Content-Type: text/html; charset=utf-8\r\n" +
+            $"Referer: {_url}\r\n" +
+            $"Origin: {payloadOrigin}";
+
+        e.Response = TurnstileWebView.CoreWebView2.Environment
+            .CreateWebResourceResponse(stream, 200, "OK", headers);
     }
 
     // -----------------------------------------------------------------------
@@ -151,10 +169,8 @@ public sealed partial class TurnstileWindow : Window
 
     private string BuildTurnstileHtml()
     {
-        // Sitekey is injected server-side (before any JS runs) and HTML-encoded.
-        // The payload URL is used only as the navigation target above - it is
-        // never written into the HTML, never shown in the address bar (the
-        // WebView has no chrome), and never accessible to page JavaScript.
+        // _url and payloadOrigin are NOT written into the HTML.
+        // Only the sitekey (which is not secret) is embedded.
         var escapedSitekey = System.Net.WebUtility.HtmlEncode(_sitekey);
 
         return $@"<!DOCTYPE html>
@@ -219,8 +235,22 @@ public sealed partial class TurnstileWindow : Window
     }
 
     // -----------------------------------------------------------------------
-    // WebView2 event handlers
+    // Navigation guard - only allow Cloudflare and internal resources
     // -----------------------------------------------------------------------
+
+    private void OnNavigationStarting(object? sender,
+        CoreWebView2NavigationStartingEventArgs e)
+    {
+        var uri = e.Uri ?? "";
+        bool isAllowed =
+            uri.Equals(InternalUrl,            StringComparison.OrdinalIgnoreCase) ||
+            uri.StartsWith("about:",           StringComparison.OrdinalIgnoreCase) ||
+            uri.StartsWith("data:",            StringComparison.OrdinalIgnoreCase) ||
+            uri.Contains("cloudflare.com",     StringComparison.OrdinalIgnoreCase);
+
+        if (!isAllowed)
+            e.Cancel = true;
+    }
 
     private void OnNavigationCompleted(object? sender,
         CoreWebView2NavigationCompletedEventArgs e)
@@ -228,24 +258,9 @@ public sealed partial class TurnstileWindow : Window
         Dispatcher.Invoke(() => LoadingOverlay.Visibility = Visibility.Collapsed);
     }
 
-    private void OnNavigationStarting(object? sender,
-        CoreWebView2NavigationStartingEventArgs e)
-    {
-        // After our page is served, allow:
-        //   - The initial navigation to _url (handled by WebResourceRequested above)
-        //   - All cloudflare.com sub-navigations (challenge iframes, etc.)
-        //   - about: / data: internal URIs
-        // Block everything else.
-        var uri = e.Uri ?? "";
-        bool isAllowed =
-            uri.Equals(_url, StringComparison.OrdinalIgnoreCase) ||
-            uri.StartsWith("about:",         StringComparison.OrdinalIgnoreCase) ||
-            uri.StartsWith("data:",          StringComparison.OrdinalIgnoreCase) ||
-            uri.Contains("cloudflare.com",   StringComparison.OrdinalIgnoreCase);
-
-        if (!isAllowed)
-            e.Cancel = true;
-    }
+    // -----------------------------------------------------------------------
+    // Web message handling
+    // -----------------------------------------------------------------------
 
     private void OnWebMessageReceived(object? sender,
         CoreWebView2WebMessageReceivedEventArgs e)
@@ -266,7 +281,6 @@ public sealed partial class TurnstileWindow : Window
                     var token = root.TryGetProperty("token", out var tk)
                         ? tk.GetString() ?? ""
                         : "";
-
                     if (string.IsNullOrWhiteSpace(token))
                         FireFailure("token_expired");
                     else
@@ -276,11 +290,9 @@ public sealed partial class TurnstileWindow : Window
                     }
                     break;
                 }
-
                 case "expired":
                     FireFailure("token_expired");
                     break;
-
                 case "error":
                 {
                     var code = root.TryGetProperty("error", out var err)
@@ -298,7 +310,7 @@ public sealed partial class TurnstileWindow : Window
     }
 
     // -----------------------------------------------------------------------
-    // Timeout - mirrors Android SDK's "load_timeout" failure
+    // Timeout
     // -----------------------------------------------------------------------
 
     private void StartLoadTimeout()
@@ -316,7 +328,7 @@ public sealed partial class TurnstileWindow : Window
     }
 
     // -----------------------------------------------------------------------
-    // Cancel button
+    // Cancel / close
     // -----------------------------------------------------------------------
 
     private void BtnCancel_Click(object sender, RoutedEventArgs e)
