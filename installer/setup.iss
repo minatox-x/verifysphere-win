@@ -30,10 +30,10 @@
 #define MyAppURLScheme "verifysphere"
 ; Fixed GUID for this application - do not change between releases, it is
 ; what lets Windows treat upgrades as the same app rather than a new install.
-#define MyAppId "{A7F3E2D1-9C4B-4A8E-8F1D-3B6C9E2A5F70}"
+#define MyAppId "A7F3E2D1-9C4B-4A8E-8F1D-3B6C9E2A5F70"
 
 [Setup]
-AppId={#MyAppId}
+AppId={{{#MyAppId}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
